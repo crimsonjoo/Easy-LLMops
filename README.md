@@ -8,7 +8,7 @@
 #### 1. ChatGPT API
 #### 2. HF transformer Library
 #### 3. Docker Image(AWS:ECR, GCP:GCR)
-#### 4. Docker Container(AWS;ECS)
+#### 4. Docker Container(AWS:ECS)
 #### 5. Kubernetes (AWS:EKS, GCP:GKE)
 #### 6. Github Action (CI/CD pipeline)
 #### 7. Monitor (Whylog-Langkit)
