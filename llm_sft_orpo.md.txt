@@ -1,0 +1,202 @@
+아래는 기존의 절차 기반 코드를 클래스로 모듈화한 예시입니다. 필요에 따라 메서드나 인자를 더 세분화하거나, Trainer 매핑을 외부 파일/클래스로 분리해도 좋습니다.
+
+```python
+import os
+import torch
+import logging
+from typing import Dict, Any, Optional
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTTrainer, ORPOTrainer
+from datasets import load_dataset
+
+logging.basicConfig(level=logging.INFO)
+
+class LLMFineTuningManager:
+    """
+    LLM 파인튜닝을 위해 필요한 로직을 하나의 클래스로 묶어 모듈화한 예시.
+    싱글/멀티 GPU 학습, 다양한 trl Trainer(SFT, ORPO 등) 설정을 유연하게 적용할 수 있습니다.
+    """
+
+    TRAINER_MAP = {
+        'sft': SFTTrainer,
+        'orpo': ORPOTrainer,
+        # 필요에 따라 다른 Trainer를 추가
+    }
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        trainer_type: str = 'sft',
+        train_data_path: Optional[str] = None,
+        eval_data_path: Optional[str] = None,
+        max_train_samples: Optional[int] = None,
+        max_eval_samples: Optional[int] = None,
+        output_dir: str = './results',
+        **trainer_kwargs,
+    ):
+        """
+        파인튜닝에 필요한 주요 설정값과 hyperparams를 초기화합니다.
+        """
+        self.model_name_or_path = model_name_or_path
+        self.trainer_type = trainer_type.lower()
+        self.train_data_path = train_data_path
+        self.eval_data_path = eval_data_path
+        self.max_train_samples = max_train_samples
+        self.max_eval_samples = max_eval_samples
+        self.output_dir = output_dir
+        self.trainer_kwargs = trainer_kwargs
+
+        # 모델/토크나이저, 데이터셋, Trainer 등을 저장할 변수
+        self.tokenizer = None
+        self.model = None
+        self.train_dataset = None
+        self.eval_dataset = None
+        self.trainer = None
+
+    def setup_model_and_tokenizer(self):
+        """
+        모델과 토크나이저를 불러오고, 필요한 경우 pad_token 등을 설정합니다.
+        """
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path)
+        logging.info(f"Loaded model and tokenizer from {self.model_name_or_path}")
+
+    def load_datasets(self):
+        """
+        train_data_path, eval_data_path를 이용해 로컬 json 파일이나
+        예시 public dataset(imdb 등)을 불러옵니다.
+        """
+        if self.train_data_path:
+            raw_train_dataset = load_dataset('json', data_files=self.train_data_path)['train']
+        else:
+            raw_train_dataset = load_dataset('imdb', split='train')
+
+        if self.eval_data_path:
+            raw_eval_dataset = load_dataset('json', data_files=self.eval_data_path)['train']
+        else:
+            raw_eval_dataset = load_dataset('imdb', split='test')
+
+        # 간단한 예시 전처리함수 정의
+        def preprocess_function(examples):
+            return self.tokenizer(examples['text'], padding='max_length', truncation=True)
+
+        self.train_dataset = raw_train_dataset.map(preprocess_function, batched=True)
+        self.eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
+
+        # 필요한 경우 샘플 수를 제한
+        if self.max_train_samples:
+            self.train_dataset = self.train_dataset.select(range(self.max_train_samples))
+        if self.max_eval_samples:
+            self.eval_dataset = self.eval_dataset.select(range(self.max_eval_samples))
+
+        logging.info("Datasets loaded and preprocessed.")
+
+    def create_trainer(self):
+        """
+        trainer_type에 대응하는 trl Trainer 인스턴스를 생성합니다.
+        """
+        trainer_cls = self.TRAINER_MAP.get(self.trainer_type)
+        if trainer_cls is None:
+            raise ValueError(f"Unknown trainer type: {self.trainer_type}")
+
+        self.trainer = trainer_cls(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.eval_dataset,
+            **self.trainer_kwargs
+        )
+        logging.info(f"Created {self.trainer_type} trainer.")
+
+    def train(self):
+        """
+        Trainer를 이용해 파인튜닝을 수행합니다.
+        """
+        if not self.trainer:
+            raise RuntimeError("Trainer is not created. Call create_trainer() first.")
+
+        self.trainer.train()
+        logging.info("Training completed.")
+
+    def save(self):
+        """
+        학습이 완료된 모델과 토크나이저를 지정된 output 디렉토리에 저장합니다.
+        """
+        if not self.trainer:
+            raise RuntimeError("Trainer is not created. Cannot save model.")
+
+        self.trainer.save_model(self.output_dir)
+        self.tokenizer.save_pretrained(self.output_dir)
+        logging.info(f"Model and tokenizer saved to {self.output_dir}")
+
+    def run_finetuning(self):
+        """
+        전체 파이프라인(모델/토크나이저 불러오기 -> 데이터셋 로드 -> Trainer 생성 -> 학습 -> 저장)을
+        순차적으로 실행합니다.
+        """
+        self.setup_model_and_tokenizer()
+        self.load_datasets()
+        self.create_trainer()
+        self.train()
+        self.save()
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--model_name_or_path', type=str, default='gpt2')
+    parser.add_argument('--trainer_type', type=str, default='sft', help='sft or orpo etc.')
+    parser.add_argument('--train_data_path', type=str, default=None)
+    parser.add_argument('--eval_data_path', type=str, default=None)
+    parser.add_argument('--max_train_samples', type=int, default=None)
+    parser.add_argument('--max_eval_samples', type=int, default=None)
+    parser.add_argument('--output_dir', type=str, default='./results')
+
+    # 예시로 학습 하이퍼파라미터 추가
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--num_train_epochs', type=int, default=1)
+
+    args = parser.parse_args()
+
+    trainer_args = {
+        'learning_rate': args.learning_rate,
+        'per_device_train_batch_size': args.batch_size,
+        'num_train_epochs': args.num_train_epochs,
+        # 필요 시 gradient_accumulation_steps, logging_steps 등 추가
+    }
+
+    manager = LLMFineTuningManager(
+        model_name_or_path=args.model_name_or_path,
+        trainer_type=args.trainer_type,
+        train_data_path=args.train_data_path,
+        eval_data_path=args.eval_data_path,
+        max_train_samples=args.max_train_samples,
+        max_eval_samples=args.max_eval_samples,
+        output_dir=args.output_dir,
+        **trainer_args
+    )
+    manager.run_finetuning()
+
+
+if __name__ == '__main__':
+    # 멀티 GPU 학습은 아래처럼 accelerate CLI를 통해
+    # a`...
+    main()
+```
+
+### 코드 구조 설명
+
+- **LLMFineTuningManager** 클래스:
+  - 모델, 토크나이저, 데이터셋, Trainer 설정 등을 관리합니다.
+  - `run_finetuning` 메서드로 전체 파이프라인을 한 번에 실행할 수 있으며, 세부 단계(`setup_model_and_tokenizer`, `load_datasets`, `create_trainer`, `train`, `save`)를 개별적으로도 호출 가능.
+- **TRAINER\_MAP**: trl 라이브러리의 다양한 Trainer(SFTTrainer, ORPOTrainer 등)를 trainer\_type 문자열과 매핑합니다.
+- **main 함수**: CLI 인자로 설정을 받은 뒤, `LLMFineTuningManager` 인스턴스를 생성하고 `run_finetuning`을 호출합니다.
+
+이렇게 클래스로 묶어 두면, 필요한 부분만 오버라이딩하거나 확장해 재사용하기 편리해집니다. 예를 들어, 데이터 전처리 과정을 `load_datasets` 메서드를 상속받아 원하는 방식으로 수정하거나, Trainer 인스턴스 생성 방식을 재정의하는 등 유지보수와 확장이 용이해집니다.
+
